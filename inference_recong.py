@@ -136,12 +136,12 @@ def infer_single_image(model, image_path, classes_list, in_chans, device):
 
     with torch.no_grad():
         if device.type == 'cuda':
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 output = model(img_tensor)
         else:
             output = model(img_tensor)
             
-        probabilities = torch.nn.functional.softmax(output, dim=1)
+        probabilities = torch.nn.functional.softmax(output.float(), dim=1)
         
         k = min(3, len(classes_list))
         topk_confs, topk_indices = torch.topk(probabilities, k=k, dim=1)
@@ -180,7 +180,7 @@ def validate_directory(model, dir_path, in_chans, device):
     with torch.no_grad():
         for inputs, labels in dataloader:
             inputs, labels = inputs.to(device), labels.to(device)
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
                 outputs = model(inputs)
             
             total += labels.size(0)
@@ -236,10 +236,10 @@ def validate_directory(model, dir_path, in_chans, device):
 # 3. Main Execution
 # ==========================================
 if __name__ == '__main__':
-    MODEL_WEIGHTS = 'model_weights/20260706_131648/model_epoch_1195_acc_97.9.pth' 
+    MODEL_WEIGHTS = 'model_weights/20260720_140225/model_epoch_1200_acc_60.9.pth' 
     
     # You can set TARGET_PATH to either a specific .tif file OR a directory like 'data/test'
-    TARGET_PATH = 'data/validation_4'  # Example for single file inference
+    TARGET_PATH = 'train_test_2_MultiFrame_SingleAngle/data/test'  # Example for single file inference
     
     CLASSES = ['n1_m6','n1_m30','n1_m60','n1_m90','n2_m6','n2_m30','n2_m60','n2_m90'
              ,'n4_m6','n4_m30','n4_m60','n4_m90','n6_m6','n6_m30','n6_m60','n6_m90']
