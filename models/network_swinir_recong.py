@@ -593,6 +593,7 @@ class SwinIR(nn.Module):
     """
 
     def __init__(self, img_size=64, patch_size=1, in_chans=3, num_classes=10,
+                 num_n_groups=4, num_m_groups=4,
                  embed_dim=96, depths=[6, 6, 6, 6], num_heads=[6, 6, 6, 6],
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
@@ -684,6 +685,11 @@ class SwinIR(nn.Module):
         ################################ 3, Recognition Head ################################################
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
+        # Auxiliary heads for multi-task training, sharing the same pooled trunk feature as the main head.
+        # Only used when forward(..., return_aux=True) is called (i.e. during training); ignored otherwise.
+        self.head_n = nn.Linear(self.num_features, num_n_groups) if num_n_groups > 0 else None
+        self.head_m = nn.Linear(self.num_features, num_m_groups) if num_m_groups > 0 else None
+
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -725,28 +731,33 @@ class SwinIR(nn.Module):
 
         return x
 
-    def forward(self, x):
+    def forward(self, x, return_aux=False):
         x = self.check_image_size(x) #pad the image to be divisible by window_size
 
         # normalize to [0, 1]
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
-        # 1. 
+        # 1.
         x_first = self.conv_first(x)
-        
+
         # 2. RSTB
         res = self.forward_features(x_first)
-        
+
         x = self.conv_after_body(res) + x_first  # Shape: (B, C, H, W)
 
         # 3. Global Average Pooling
-        x = F.adaptive_avg_pool2d(x, (1, 1))  
-        x = torch.flatten(x, 1)               
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = torch.flatten(x, 1)
 
-        x = self.head(x)                      
+        out = self.head(x)
 
-        return x
+        if return_aux:
+            output_n = self.head_n(x) if self.head_n is not None else None
+            output_m = self.head_m(x) if self.head_m is not None else None
+            return out, output_n, output_m
+
+        return out
 
     def flops(self):
         flops = 0

@@ -145,6 +145,7 @@ def validate(model, test_loader, device, criterion):
     
     correct_top1, correct_top2, correct_top3 = 0, 0, 0
     grp_correct_top1, grp_correct_top2, grp_correct_top3 = 0, 0, 0
+    grp2_correct_top1, grp2_correct_top2, grp2_correct_top3 = 0, 0, 0
     total = 0
     
     with torch.no_grad():
@@ -183,7 +184,18 @@ def validate(model, test_loader, device, criterion):
                     grp_correct_top2 += 1
                 if grp_label in grp_preds[:3]:
                     grp_correct_top3 += 1
-    
+
+                # Group2 Accuracy (m6, m30, m60, m90): index % 4 maps 0-15 into groups 0, 1, 2, 3
+                grp2_label = label % 4
+                grp2_preds = [p % 4 for p in preds]
+
+                if grp2_label == grp2_preds[0]:
+                    grp2_correct_top1 += 1
+                if grp2_label in grp2_preds[:2]:
+                    grp2_correct_top2 += 1
+                if grp2_label in grp2_preds[:3]:
+                    grp2_correct_top3 += 1
+
     metrics = {
         'loss': val_loss / len(test_loader),
         'top1': 100. * correct_top1 / total,
@@ -192,6 +204,9 @@ def validate(model, test_loader, device, criterion):
         'grp_top1': 100. * grp_correct_top1 / total,
         'grp_top2': 100. * grp_correct_top2 / total,
         'grp_top3': 100. * grp_correct_top3 / total,
+        'grp2_top1': 100. * grp2_correct_top1 / total,
+        'grp2_top2': 100. * grp2_correct_top2 / total,
+        'grp2_top3': 100. * grp2_correct_top3 / total,
     }
     return metrics
 # ==========================================
@@ -220,20 +235,26 @@ def main(manual_seed=None):
     params = {
         "seed": actual_seed, 
         "device": 'cuda',
-        "batch_size": 10,
+        "batch_size": 6,
         "start_epoch": 0,      # Default value, will be auto-updated if resuming
         "epochs": 1200,         
-        "lr": 1e-3,
+        "lr": 1e-4,
         "num_classes": 16,
         "in_chans": 1,
         "test_every": 5,
         "embed_dim": 96,
-        "depths": [3, 3, 3, 3],
+        "depths": [6, 6, 6, 6],
         "num_heads": [4, 4, 4, 4],
-        
+
+        # --- Auxiliary Multi-Task Loss Settings ---
+        # n is already ~solved (96.9% top-1), m is the bottleneck (60.9% top-1),
+        # so the m auxiliary head is weighted higher to push extra gradient signal there.
+        "aux_weight_n": 0.2,
+        "aux_weight_m": 0.5,
+
         # --- Resume Training Settings ---
-        "resume_path": None, # Path to the checkpoint to resume training
-        "resume_append_dir": None # Whether to append to the existing run directory when resuming
+        "resume_path": "model_weights/20260720_140225/model_epoch_1200_acc_60.9.pth", # Path to the checkpoint to resume training
+        "resume_append_dir": False  # Whether to append to the existing run directory when resuming
     }
 
     
@@ -297,8 +318,8 @@ def main(manual_seed=None):
         T.RandomAffine(
             degrees=180,           # random rotation between -180 and 180 degrees
             translate=(0.15, 0.15),  # random translation up to 30% of image dimensions
-            scale=(0.6, 1.4),      # random scaling between 60% and 140%
-            fill=0                 # fill the regions outside the image with 0 (assuming background is 0)
+            scale=(0.7, 1.4),      # random scaling 
+            fill=0                 # fill the regions outside the image with 0
         ),
         T.RandomHorizontalFlip(p=0.5), # 50% probability of horizontal flip
         T.RandomVerticalFlip(p=0.5)    # 50% probability of vertical flip
@@ -315,9 +336,11 @@ def main(manual_seed=None):
     # --- 2. Initialize Model ---
     model = SwinIR(
         img_size=64, #if the number is not compatible with intput image size, it will be automatically adjusted in the model's forward method
-        in_chans=params["in_chans"], 
+        in_chans=params["in_chans"],
         num_classes=params["num_classes"],
-        window_size=8, 
+        num_n_groups=4,
+        num_m_groups=4,
+        window_size=8,
         depths=params["depths"], 
         embed_dim=params["embed_dim"], 
         num_heads=params["num_heads"],
@@ -328,8 +351,10 @@ def main(manual_seed=None):
     # --- 2.5 Load Resume Checkpoint ---
     if is_resuming:
         print(f"Loading weights from checkpoint: {params['resume_path']}")
-        model.load_state_dict(torch.load(params["resume_path"], map_location=device))
-        print("Checkpoint loaded successfully.")
+        # strict=False: older checkpoints saved before the aux heads existed won't have
+        # head_n/head_m weights; those simply stay randomly initialized.
+        missing_unexpected = model.load_state_dict(torch.load(params["resume_path"], map_location=device), strict=False)
+        print(f"Checkpoint loaded. Missing keys: {missing_unexpected.missing_keys}, Unexpected keys: {missing_unexpected.unexpected_keys}")
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=params["lr"], weight_decay=1e-4, eps=1e-8)
@@ -341,7 +366,7 @@ def main(manual_seed=None):
         optimizer, 
         mode='min', 
         factor=0.75, 
-        patience=4, 
+        patience=5, 
         min_lr=1e-6
     )
     
@@ -351,35 +376,45 @@ def main(manual_seed=None):
     # The loop will start from start_epoch and continue until epochs
     for epoch in range(params["start_epoch"], params["epochs"]):
         model.train()
-        train_loss = 0.0
+        train_loss_main = 0.0
+        train_loss_aux = 0.0
         train_correct = 0
         train_total = 0
-        
+
         for i, (inputs, labels) in enumerate(train_loader):
             inputs, labels = inputs.to(device), labels.to(device)
-              
+            # n-group = label // 4 (n1,n2,n4,n6), m-group = label % 4 (m6,m30,m60,m90);
+            # consistent with the grouping already used in validate()'s grp/grp2 metrics.
+            n_labels = labels // 4
+            m_labels = labels % 4
+
             optimizer.zero_grad()
-            
+
             with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                outputs = model(inputs)
-                    
-                loss = criterion(outputs, labels)
-            
+                outputs, outputs_n, outputs_m = model(inputs, return_aux=True)
+
+                loss_main = criterion(outputs, labels)
+                loss_n = criterion(outputs_n, n_labels)
+                loss_m = criterion(outputs_m, m_labels)
+                loss = loss_main + params["aux_weight_n"] * loss_n + params["aux_weight_m"] * loss_m
+
             scaler.scale(loss).backward()
-            
+
             #DEBUG 5
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
+
             scaler.step(optimizer)
             scaler.update()
-            
-            train_loss += loss.item()
+
+            train_loss_main += loss_main.item()
+            train_loss_aux += (loss_n.item() + loss_m.item())
             _, predicted = outputs.max(1)
             train_total += labels.size(0)
             train_correct += predicted.eq(labels).sum().item()
 
-        avg_train_loss = train_loss / len(train_loader)
+        avg_train_loss = train_loss_main / len(train_loader)
+        avg_train_aux_loss = train_loss_aux / len(train_loader)
         train_acc = 100. * train_correct / train_total
 
         # Validation and Checkpoint Saving
@@ -391,10 +426,11 @@ def main(manual_seed=None):
             current_lr = optimizer.param_groups[0]['lr']
             
             print(f">>> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Epoch {epoch+1}] ")
-            print(f"    Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.2f}% | LR: {current_lr:.2e}")
+            print(f"    Train Loss: {avg_train_loss:.4f} (Aux n+m: {avg_train_aux_loss:.4f}) | Train Acc: {train_acc:.2f}% | LR: {current_lr:.2e}")
             print(f"    Val Loss:   {val_loss:.4f}")
             print(f"    n&m Acc -> Top1: {val_metrics['top1']:.2f}% | Top2: {val_metrics['top2']:.2f}% | Top3: {val_metrics['top3']:.2f}%")
             print(f"    n Acc -> Top1: {val_metrics['grp_top1']:.2f}% | Top2: {val_metrics['grp_top2']:.2f}% | Top3: {val_metrics['grp_top3']:.2f}%")
+            print(f"    m Acc -> Top1: {val_metrics['grp2_top1']:.2f}% | Top2: {val_metrics['grp2_top2']:.2f}% | Top3: {val_metrics['grp2_top3']:.2f}%")
             print("-" * 60)
             
             save_path = os.path.join(run_dir, f'model_epoch_{epoch+1}_acc_{val_metrics["top1"]:.1f}.pth')
@@ -402,18 +438,19 @@ def main(manual_seed=None):
             
             with open(info_file, 'a') as f:
                 f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Epoch {epoch+1}:\n"
-                        f"  Train: Loss={avg_train_loss:.4f}, Acc={train_acc:.2f}%, LR={current_lr:.2e}\n"
+                        f"  Train: Loss={avg_train_loss:.4f} (Aux n+m={avg_train_aux_loss:.4f}), Acc={train_acc:.2f}%, LR={current_lr:.2e}\n"
                         f"  Val:   Loss={val_loss:.4f}\n"
                         f"  n&m Acc: T1={val_metrics['top1']:.2f}%, T2={val_metrics['top2']:.2f}%, T3={val_metrics['top3']:.2f}%\n"
-                        f"  n Acc: T1={val_metrics['grp_top1']:.2f}%, T2={val_metrics['grp_top2']:.2f}%, T3={val_metrics['grp_top3']:.2f}%\n\n")
-                
+                        f"  n Acc: T1={val_metrics['grp_top1']:.2f}%, T2={val_metrics['grp_top2']:.2f}%, T3={val_metrics['grp_top3']:.2f}%\n"
+                        f"  m Acc: T1={val_metrics['grp2_top1']:.2f}%, T2={val_metrics['grp2_top2']:.2f}%, T3={val_metrics['grp2_top3']:.2f}%\n\n")
+
             # Step the scheduler based on validation loss
             scheduler.step(val_loss)
-            
+
         else:
             current_lr = optimizer.param_groups[0]['lr']
             print(f">>> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} [Epoch {epoch+1}] "
-                  f"Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.2f}% | LR: {current_lr:.2e}")
+                  f"Train Loss: {avg_train_loss:.4f} (Aux n+m: {avg_train_aux_loss:.4f}) | Train Acc: {train_acc:.2f}% | LR: {current_lr:.2e}")
     # --- Finalize Training Time ---
     end_wall_time = time.time()
     total_duration = end_wall_time - start_wall_time

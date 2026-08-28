@@ -107,7 +107,9 @@ def load_model_dynamically(model_path, classes_list, fallback_in_chans, device):
     model = SwinIR(**model_kwargs).to(device)
     print(f"Loading weights from: {model_path}")
     state_dict = torch.load(model_path, map_location=device)
-    model.load_state_dict(state_dict)
+    # strict=False: checkpoints saved before the head_n/head_m auxiliary heads existed
+    # won't have those keys; that's fine since inference only ever uses the main head.
+    model.load_state_dict(state_dict, strict=False)
     model.eval()
     
     return model, model_kwargs['in_chans']
@@ -239,10 +241,15 @@ if __name__ == '__main__':
     MODEL_WEIGHTS = 'model_weights/20260720_140225/model_epoch_1200_acc_60.9.pth' 
     
     # You can set TARGET_PATH to either a specific .tif file OR a directory like 'data/test'
-    TARGET_PATH = 'train_test_2_MultiFrame_SingleAngle/data/test'  # Example for single file inference
-    
-    CLASSES = ['n1_m6','n1_m30','n1_m60','n1_m90','n2_m6','n2_m30','n2_m60','n2_m90'
-             ,'n4_m6','n4_m30','n4_m60','n4_m90','n6_m6','n6_m30','n6_m60','n6_m90']
+    TARGET_PATH = 'data/test'  # Example for single file inference
+
+    # Class order MUST match the label index order ScientificRecognitionDataset assigns during
+    # training, i.e. sorted(os.listdir(<train_dir>)). A hand-typed "natural" order like
+    # ['n1_m6','n1_m30',...] silently mismatches that (e.g. "n1_m30" < "n1_m6" lexicographically,
+    # since '3' < '6'), causing predicted indices to be labeled with the wrong class name. Deriving
+    # it from the actual training folder avoids that class of bug entirely.
+    CLASSES_SOURCE_DIR = 'data/train'
+    CLASSES = sorted(os.listdir(CLASSES_SOURCE_DIR))
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
